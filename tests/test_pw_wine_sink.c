@@ -165,6 +165,54 @@ static void test_audio(void)
     pw_wine_sink_stats(NULL);
 }
 
+static void test_two_pads(void)
+{
+    PwWinePad first={.buttons=0x1000,.left_trigger=12,.thumb_lx=-30000};
+    PwWinePad second={.buttons=0x2000,.right_trigger=200,.thumb_ry=31000},a,b;
+    uint32_t left,right,changes=pw_wine_pad_changes();
+    int fd=pw_wine_input_fd();
+    char drain[64];
+    while(read(fd,drain,sizeof(drain))>0){}
+    assert(pw_wine_set_pad_indexed(0,&first)==0);
+    assert(pw_wine_set_pad_indexed(1,&second)==0);
+    assert(pw_wine_pad_changes()==changes+1 && read(fd,drain,sizeof(drain))==1);
+    assert(pw_wine_pad(&a) && pw_wine_pad_indexed(1,&b));
+    assert(a.buttons==first.buttons && a.left_trigger==12 && a.thumb_lx==-30000);
+    assert(b.buttons==second.buttons && b.right_trigger==200 && b.thumb_ry==31000 && b.packet==1);
+    uint32_t first_packet=a.packet;
+    second.thumb_ry=-1;
+    assert(!pw_wine_set_pad_indexed(1,&second));
+    assert(pw_wine_pad_indexed(1,&b) && b.packet==2 && b.thumb_ry==-1);
+    assert(pw_wine_pad(&a) && a.packet==first_packet);
+    assert(pw_wine_pad_changes()==changes+1 && read(fd,drain,1)==-1);
+
+    (void)pw_wine_rumble(NULL,NULL);
+    pw_wine_set_rumble(100,200);
+    assert(!pw_wine_set_rumble_indexed(1,300,70000));
+    assert(pw_wine_rumble_indexed(1,&left,&right) && left==300 && right==65535);
+    assert(pw_wine_rumble(&left,&right) && left==100 && right==200);
+    assert(!pw_wine_rumble_indexed(1,NULL,NULL) && !pw_wine_rumble(NULL,NULL));
+    assert(!pw_wine_set_pad_indexed(1,NULL));
+    assert(!pw_wine_pad_indexed(1,&b) && !b.buttons && !b.packet && !b.thumb_ry);
+    assert(pw_wine_rumble_indexed(1,&left,&right) && !left && !right);
+    assert(!pw_wine_rumble(&left,&right) && left==100 && right==200);
+    assert(pw_wine_pad(&a) && a.packet==first_packet);
+    assert(pw_wine_pad_changes()==changes+2 && read(fd,drain,sizeof(drain))==1);
+    assert(!pw_wine_set_pad_indexed(1,NULL) && pw_wine_pad_changes()==changes+2);
+    assert(!pw_wine_set_pad_indexed(1,&second));
+    assert(pw_wine_pad_indexed(1,&b) && b.packet==3);
+    assert(pw_wine_pad_changes()==changes+3 && read(fd,drain,sizeof(drain))==1);
+    assert(!pw_wine_rumble_indexed(1,&left,&right) && !left && !right);
+
+    assert(pw_wine_set_pad_indexed(PW_WINE_PADS,&second)==-1);
+    assert(pw_wine_set_rumble_indexed(UINT32_MAX,9,9)==-1);
+    assert(!pw_wine_pad_indexed(PW_WINE_PADS,&b) && !b.connected);
+    assert(!pw_wine_pad_indexed(1,NULL));
+    assert(!pw_wine_rumble_indexed(UINT32_MAX,NULL,NULL));
+    assert(pw_wine_pad(&a) && a.packet==first_packet && a.buttons==first.buttons);
+    assert(pw_wine_pad_changes()==changes+3 && read(fd,drain,1)==-1);
+}
+
 static void *poster(void *arg)
 {
     (void)arg;
@@ -335,6 +383,7 @@ int main(void)
     pw_wine_set_rumble(1000,0xffff);assert(!pw_wine_rumble(NULL,NULL));  /* unchanged */
     pw_wine_set_rumble(0x10000,0);assert(pw_wine_rumble(NULL,&right)==1 && right==0);
     assert(!pw_wine_rumble(&left,NULL) && left==0xffff);
+    test_two_pads();
     test_display_release();
     test_menu();
     return 0;

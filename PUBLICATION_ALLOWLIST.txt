@@ -672,6 +672,7 @@ src/pw_title_session.c
 src/pw_title_session.h
 tests/lab/pw_hid_pad.c
 tests/lab/pw_hid_pad_sink.c
+tests/lab/pw_two_pads_unix.c
 tests/test_playden_kit.py
 tests/test_prepare_playden_bottle.py
 tests/test_pw_publication_sha256.c
@@ -701,6 +702,7 @@ tools/package_playden_kit.py
 tools/prepare_playden_bottle.py
 tools/pw_registry.py
 tools/test_wine_hid_pad.py
+tools/test_wine_two_pads.py
 wine/patches/0170-ntdll-ps5-track-directories-from-the-server.patch
 tools/build_media_prx_adapters.py
 tools/build_media_ps5.py
@@ -745,3 +747,4 @@ wine/patches/0987-ntdll-report-hot-writes-only-beside-a-read-only-data-page.patc
 wine/patches/0988-ntdll-let-the-kernel-write-a-page-beside-a-protected-one.patch
 wine/patches/0989-ntdll-report-hot-writes-beside-a-read-only-page-only-on-request.patch
 wine/patches/0993-server-ps5-park-read-only-file-descriptors.patch
+wine/patches/0994-xinput-winebus-two-ps5-title-controllers.patch

@@ -149,6 +149,7 @@ before evaluating a candidate built from that cache.
 | 0988 | `ntdll`: a kernel write into a page beside a protected one (0974) works: `check_write_access` opens the host page for the write once every page written allows it, and `restore_write_access` protects it again, as for write watches. `ReadFile` into a writable buffer beside a read-only page used to fail with `ERROR_NOACCESS` (the kernel's `read()` got `EFAULT`); reads, server replies, socket receives and `NtWriteVirtualMemory` go through it. A read that stops short at such a page is finished with it open, a socket receive into one opens it before receiving (a failed copy loses the datagram), and a thread stepping over a host page that another thread protected again has it opened again |
 | 0989 | `ntdll`: the hot write 0974 reports to the program as a write to the read-only page beside it is reported only with `PW_SUBPAGE_REPORT=1`, for emulators that drop recompiled code when told. By default the host page takes the union of its pages' protections instead, as beside an inaccessible page (0986) or a code page (0987): a game without a handler for that access violation ended |
 | 0993 | `server`: a PS5 title can hold about 256 open files (open() fails with EMFILE after 249 on FW 13.60, whatever RLIMIT_NOFILE says, while dup(), pipes and sockets reach 12554 descriptors), and every file a handle refers to is one the in-process server keeps open, so games that keep a few hundred archives open (Unreal .pak/.utoc/.ucas or .upk, mod jars) ran out and then failed every open and DLL load. Read-only regular files get a budget: the client caches the descriptors of the first 48 it asks for, which are never parked, so a game with few files keeps Wine's behaviour; later ones are handed out uncached and about 48 of them keep a server descriptor, the least recently used one being closed ("parked", as 0871) and opened again by name with the same device and inode and its file position restored. One handed out in the last 100 ms is left live (up to 72), since the client may still use its copy; when open() fails with EMFILE every live file is parked and the open retried. Locked, polled or deleted files are not parked, and a file set to be deleted has its parked handles opened again first, or the delete is refused. A section keeps its own duplicate of the descriptor, so mapped files still count. On a host Wine with a 512-descriptor limit the stock server fails `tests/test_wine_file_handles.py` (1500 files kept open and read, `PROSPERO_TEST_NOFILE=512`) at about 250 files and a server built with `PS5_PARK_FILES` passes it holding at most 120. `WINE_PS5_PARK_FILES=0` parks nothing, `=N` keeps N files live; `WINE_PS5_CACHED_FILES=N` lets the client cache N |
+| 0994 | `xinput`, `winebus`: indexed title-sink calls expose two independent controllers and rumble channels. Controller 1's HID device appears only while connected and has a distinct serial number; disconnect and reconnect do not affect controller 0. Older single-controller sinks remain supported |
 
 ## Allocator
 
@@ -655,6 +656,33 @@ the title's DualSense instead:
   `xinput1_4` and `xinputuap`) are built for i386 and x86_64 into
   `.deps/wine-ps5/pe/<arch>-windows`. `report.json` lists them under `pe`
   with their hashes.
+
+Patch 0994 extends these bridges to two controllers. The sink exports
+`pw_wine_set_pad_indexed`, `pw_wine_pad_indexed`,
+`pw_wine_set_rumble_indexed` and `pw_wine_rumble_indexed`; the unindexed calls
+still address controller 0. Packet numbers, state and rumble changes are
+independent. The title opens another signed-in user's pad automatically in
+xinput mode unless an explicit keyboard `player2` preset is selected.
+Winebus publishes a second Xbox 360 HID device with its own serial number
+when that pad connects and removes it on disconnect. The first HID device
+keeps its existing always-present, neutral-when-disconnected behaviour.
+Neither bridge changes the fallback to host HID when no title sink exists.
+This requires rebuilding both the title shell and Wine runtime in a new
+kit; updating the launcher alone does not enable it.
+
+On Linux, after applying the patch series and configuring a host Wine build:
+
+```sh
+make -C WORK/build -j2 dlls/xinput1_3/xinput1_3.so dlls/winebus.sys/winebus.so
+python3 tools/test_wine_two_pads.py --source WORK/source --build WORK/build
+```
+
+This loads the compiled Unix bridges against the real title sink and checks
+two states, WoW64's pointer-free XInput calls, separate HID identities and
+reports, independent rumble, and removal/recreation with an old device
+still being torn down. It does not run a Windows game or establish console
+acceptance. On a console, test a two-player game with two signed-in users,
+late sign-in, disconnect/reconnect, rumble on each player, and the PS menu.
 
 To use it on the console:
 - stage `xinput1_3.prx` beside `ntdll.prx`;

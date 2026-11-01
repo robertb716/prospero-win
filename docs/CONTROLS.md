@@ -104,13 +104,26 @@ SDL2 opens it as a game controller.
 
 ### DirectInput
 
-Games that read a controller through DirectInput (many games from before
-2005 or so) don't see the DualSense yet. Play them with a keyboard-and-mouse
-preset instead. Keyboard and mouse input through DirectInput should work,
-since it comes from the same place as normal Windows input, but it hasn't
-been tested.
+In `mode = xinput`, the runtime also exposes the controllers as Xbox 360
+HID gamepads. DirectInput, winmm, Raw Input and Windows.Gaming.Input use
+these devices; XInput reads the same controllers directly, without counting
+the HID devices again.
 
 ### A second player
+
+In `mode = xinput`, a second DualSense signed in as another PS5 user
+(an account or a guest) is automatically the game's second Xbox controller.
+Its buttons, sticks, triggers and rumble are independent of player 1's.
+The runtime looks again every few seconds when no second controller is
+available, including when its user signs in after the game has started.
+Disconnecting player 2 does not disconnect player 1; reconnecting makes the
+second controller available again. With multiple other users signed in,
+the runtime tries their controllers in turn.
+
+Player 2 does not navigate the title's in-game menu or close the game with
+Options + Create. A game's own pause and multiplayer menus still receive
+its buttons. Both controllers become neutral while the PS5 system overlay
+intercepts them. Games must support local multiplayer themselves.
 
 A game that two people play on one PC keyboard, each with their own keys,
 can give the second player a DualSense too. The profile names a second
@@ -128,7 +141,7 @@ the one who started it, and looks again every few seconds while there is
 none, so the second player can sign in after the game has started. With
 more users signed in, a pick that shows no controller for a few seconds,
 or loses it, makes way for the next user. Its buttons send keys through
-`player2`'s preset only: it never acts as an Xbox controller, the preset's
+`player2`'s preset only instead of the automatic second Xbox controller: the preset's
 mouse buttons and `mouse` stick are ignored, and closing the game with
 Options + Create stays the first player's.
 

@@ -1,0 +1,427 @@
+From b7c4954aaec18f6ea8db29dd89b916dbe64ac39d Mon Sep 17 00:00:00 2001
+From: Runtime Patch <patch@invalid>
+Date: Sun, 1 Nov 2026 12:05:03 +0200
+Subject: [PATCH] xinput, winebus: Support two PS5 title controllers.
+
+Read indexed title-sink state and rumble while retaining the legacy single-pad fallback. XInput keeps vibration independently for each controller. Winebus publishes a second HID device only while connected, with its own identity and haptics channel; delayed removal of an old device cannot stop the replacement controller.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ dlls/winebus.sys/bus_ps5.c | 141 +++++++++++++++++++++++++++++--------
+ dlls/xinput1_3/main.c      |  43 ++++++-----
+ dlls/xinput1_3/unixlib.c   |  27 +++++--
+ dlls/xinput1_3/unixlib.h   |   7 ++
+ 4 files changed, 162 insertions(+), 56 deletions(-)
+
+diff --git a/dlls/winebus.sys/bus_ps5.c b/dlls/winebus.sys/bus_ps5.c
+index 10c7735..657dcd1 100644
+--- a/dlls/winebus.sys/bus_ps5.c
++++ b/dlls/winebus.sys/bus_ps5.c
+@@ -47,8 +47,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(hid);
+ 
+ /* A PS5 title keeps its DualSense's state, in XINPUT_GAMEPAD terms, in its
+  * sink (wine/ps5/pw_wine_sink.h), whose calls ntdll exports; anywhere else
+- * they are missing and this bus does not start. It has one device, always
+- * present: an Xbox 360 controller, so that the HID stack gives it the &IG_
++ * they are missing and this bus does not start. Each pad is a separate
++ * Xbox 360 controller, so that the HID stack gives it the &IG_
+  * gamepad interface and its winexinput &XI_ partner, which DirectInput,
+  * winmm, Raw Input and Windows.Gaming.Input find. A disconnected pad
+  * reports a neutral state. XInput itself reads the sink directly (patch
+@@ -64,6 +64,9 @@ struct title_pad_state
+ 
+ static int (*title_pad)(struct title_pad_state *state);
+ static void (*title_rumble)(UINT32 left, UINT32 right);
++static int (*title_pad_indexed)(UINT32 index, struct title_pad_state *state);
++static int (*title_rumble_indexed)(UINT32 index, UINT32 left, UINT32 right);
++enum { PS5_PADS = 2 };
+ 
+ /* How often the pad is read: the title updates it once per frame or so. */
+ #define PS5_POLL_NS (4 * 1000 * 1000)
+@@ -76,13 +79,30 @@ static struct list event_queue = LIST_INIT(event_queue);
+ struct ps5_device
+ {
+     struct unix_device unix_device;
++    UINT32 index;
+     BOOL started;
+     BOOL have_state;
+     struct title_pad_state last;
+     UINT64 rumble_until;  /* CLOCK_MONOTONIC ns when the rumble stops; 0: until told */
+ };
+ 
+-static struct ps5_device *ps5_pad;
++static struct ps5_device *ps5_pads[PS5_PADS];
++
++static int read_pad(UINT32 index, struct title_pad_state *state)
++{
++    if (title_pad_indexed) return title_pad_indexed(index, state);
++    return !index && title_pad && title_pad(state);
++}
++
++static void set_rumble(UINT32 index, UINT32 left, UINT32 right)
++{
++    if (title_rumble_indexed)
++    {
++        if (title_rumble_indexed(index, left, right))
++            WARN("controller %u rumble rejected\n", index);
++    }
++    else if (!index && title_rumble) title_rumble(left, right);
++}
+ 
+ static inline struct ps5_device *impl_from_unix_device(struct unix_device *iface)
+ {
+@@ -119,8 +139,11 @@ static void ps5_device_stop(struct unix_device *iface)
+     pthread_mutex_lock(&ps5_cs);
+     impl->started = FALSE;
+     impl->rumble_until = 0;
+-    if (ps5_pad == impl) ps5_pad = NULL;
+-    if (title_rumble) title_rumble(0, 0);
++    if (ps5_pads[impl->index] == impl)
++    {
++        ps5_pads[impl->index] = NULL;
++        set_rumble(impl->index, 0, 0);
++    }
+     pthread_mutex_unlock(&ps5_cs);
+ }
+ 
+@@ -136,11 +159,16 @@ static NTSTATUS ps5_device_haptics_start(struct unix_device *iface, UINT duratio
+     /* The low-frequency motor is on the left, as on an Xbox controller. The
+      * title's motors keep their levels, so the bus loop stops them when the
+      * duration (the HID report's cutoff) runs out; 0 has none, as in SDL. */
+-    if (!title_rumble) return STATUS_NOT_SUPPORTED;
++    if (!title_rumble_indexed && !title_rumble) return STATUS_NOT_SUPPORTED;
+     pthread_mutex_lock(&ps5_cs);
++    if (ps5_pads[impl->index] != impl)
++    {
++        pthread_mutex_unlock(&ps5_cs);
++        return STATUS_DEVICE_NOT_CONNECTED;
++    }
+     impl->rumble_until = duration_ms && (rumble_intensity || buzz_intensity)
+                          ? monotonic_ns() + (UINT64)duration_ms * 1000000 : 0;
+-    title_rumble(rumble_intensity, buzz_intensity);
++    set_rumble(impl->index, rumble_intensity, buzz_intensity);
+     pthread_mutex_unlock(&ps5_cs);
+     return STATUS_SUCCESS;
+ }
+@@ -149,10 +177,10 @@ static NTSTATUS ps5_device_haptics_stop(struct unix_device *iface)
+ {
+     struct ps5_device *impl = impl_from_unix_device(iface);
+ 
+-    if (!title_rumble) return STATUS_NOT_SUPPORTED;
++    if (!title_rumble_indexed && !title_rumble) return STATUS_NOT_SUPPORTED;
+     pthread_mutex_lock(&ps5_cs);
+     impl->rumble_until = 0;
+-    title_rumble(0, 0);
++    if (ps5_pads[impl->index] == impl) set_rumble(impl->index, 0, 0);
+     pthread_mutex_unlock(&ps5_cs);
+     return STATUS_SUCCESS;
+ }
+@@ -235,30 +263,33 @@ static void set_report_from_state(struct unix_device *iface, const struct title_
+ 
+ /* Stops a rumble whose duration ran out, reads the pad and queues a report
+  * when it changed. Called with ps5_cs. */
+-static void ps5_poll(void)
++static void ps5_poll_pad(struct ps5_device *impl, const struct title_pad_state *state)
+ {
+-    struct ps5_device *impl = ps5_pad;
+     struct unix_device *iface;
+-    struct title_pad_state state;
+ 
+     if (!impl || !impl->started) return;
+     iface = &impl->unix_device;
+     if (impl->rumble_until && monotonic_ns() >= impl->rumble_until)
+     {
+         impl->rumble_until = 0;
+-        title_rumble(0, 0);
++        set_rumble(impl->index, 0, 0);
+     }
+-    if (!title_pad(&state)) memset(&state, 0, sizeof(state));
+-    if (impl->have_state && !memcmp(&state, &impl->last, sizeof(state))) return;
+-    impl->last = state;
++    if (impl->have_state && !memcmp(state, &impl->last, sizeof(*state))) return;
++    impl->last = *state;
+     impl->have_state = TRUE;
+ 
+-    set_report_from_state(iface, &state);
+-    bus_event_queue_input_report(&event_queue, iface, iface->hid_device_state.report_buf,
+-                                 iface->hid_device_state.report_len);
++    set_report_from_state(iface, state);
++    if (!bus_event_queue_input_report(&event_queue, iface, iface->hid_device_state.report_buf,
++                                      iface->hid_device_state.report_len))
++    {
++        WARN("controller %u input report could not be queued\n", impl->index);
++        impl->have_state = FALSE;
++    }
+ }
+ 
+-NTSTATUS ps5_bus_init(void *args)
++/* Called with ps5_cs. Slot 0 retains its always-present legacy device;
++ * slot 1 is created only when its user has a controller connected. */
++static NTSTATUS ps5_add_pad(UINT32 index)
+ {
+     static const USAGE_AND_PAGE device_usage = {.UsagePage = HID_USAGE_PAGE_GENERIC, .Usage = HID_USAGE_GENERIC_GAMEPAD};
+     static const struct title_pad_state neutral;
+@@ -279,32 +310,80 @@ NTSTATUS ps5_bus_init(void *args)
+     struct unix_device *iface;
+     struct ps5_device *impl;
+ 
+-    title_pad = dlsym(RTLD_DEFAULT, "pw_wine_pad");
+-    title_rumble = dlsym(RTLD_DEFAULT, "pw_wine_set_rumble");
+-    if (!title_pad) return STATUS_NOT_SUPPORTED;
+-    TRACE("found the title's controller\n");
+-
+     if (!(impl = hid_device_create(&ps5_device_vtbl, sizeof(struct ps5_device)))) return STATUS_NO_MEMORY;
++    impl->index = index;
++    if (index) desc.input = index;
++    desc.serialnumber[3] = '0' + index;
+     iface = &impl->unix_device;
+     if (!hid_device_begin_report_descriptor(iface, &device_usage)) goto failed;
+     if (!hid_device_add_gamepad(iface)) goto failed;
+-    if (title_rumble && !hid_device_add_haptics(iface)) goto failed;
++    if ((title_rumble_indexed || title_rumble) && !hid_device_add_haptics(iface)) goto failed;
+     if (!hid_device_end_report_descriptor(iface)) goto failed;
+     set_report_from_state(iface, &neutral);
+ 
+-    pthread_mutex_lock(&ps5_cs);
+-    ps5_stopping = FALSE;
+-    ps5_pad = impl;
+-    bus_event_queue_device_created(&event_queue, iface, &desc);
+-    pthread_mutex_unlock(&ps5_cs);
++    if (!bus_event_queue_device_created(&event_queue, iface, &desc)) goto failed;
++    ps5_pads[index] = impl;
+     return STATUS_SUCCESS;
+ 
+ failed:
++    free(iface->hid_device_state.report_buf);
++    free(iface->hid_device_state.last_report_buf);
+     free(iface->hid_report_descriptor.data);
+     free(impl);
+     return STATUS_NO_MEMORY;
+ }
+ 
++static void ps5_poll(void)
++{
++    UINT32 index;
++    for (index = 0; index < PS5_PADS; index++)
++    {
++        struct title_pad_state state = {0};
++        struct ps5_device *impl = ps5_pads[index];
++        if (!read_pad(index, &state)) memset(&state, 0, sizeof(state));
++        if (index && impl && !state.connected)
++        {
++            if (!bus_event_queue_device_removed(&event_queue, &impl->unix_device))
++            {
++                WARN("controller %u removal could not be queued\n", index);
++                continue;
++            }
++            set_rumble(index, 0, 0);
++            ps5_pads[index] = NULL;
++            continue;
++        }
++        if (!impl && (state.connected || !index))
++        {
++            NTSTATUS status = ps5_add_pad(index);
++            if (status)
++            {
++                WARN("controller %u creation failed, status %#x\n", index, (unsigned int)status);
++                continue;
++            }
++            impl = ps5_pads[index];
++        }
++        ps5_poll_pad(impl, &state);
++    }
++}
++
++NTSTATUS ps5_bus_init(void *args)
++{
++    NTSTATUS status;
++
++    title_pad = dlsym(RTLD_DEFAULT, "pw_wine_pad");
++    title_rumble = dlsym(RTLD_DEFAULT, "pw_wine_set_rumble");
++    title_pad_indexed = dlsym(RTLD_DEFAULT, "pw_wine_pad_indexed");
++    title_rumble_indexed = dlsym(RTLD_DEFAULT, "pw_wine_set_rumble_indexed");
++    if (!title_pad_indexed && !title_pad) return STATUS_NOT_SUPPORTED;
++    TRACE("found the title's controllers\n");
++
++    pthread_mutex_lock(&ps5_cs);
++    ps5_stopping = FALSE;
++    status = ps5_add_pad(0);
++    pthread_mutex_unlock(&ps5_cs);
++    return status;
++}
++
+ NTSTATUS ps5_bus_wait(void *args)
+ {
+     struct bus_event *result = args;
+diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
+index 83cee15..3def900 100644
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -110,7 +110,7 @@ static XINPUT_STATE current_state[XUSER_MAX_COUNT];
+  * xinput uses HID. */
+ static unixlib_handle_t title_pad;
+ static BOOL title_pad_enabled = TRUE;
+-static XINPUT_VIBRATION title_pad_vibration;
++static XINPUT_VIBRATION title_pad_vibration[XUSER_MAX_COUNT];
+ 
+ static BOOL WINAPI find_title_pad(INIT_ONCE *once, void *param, void **context)
+ {
+@@ -130,7 +130,7 @@ static BOOL WINAPI find_title_pad(INIT_ONCE *once, void *param, void **context)
+         __wine_unload_unix_lib(module);
+         return TRUE;
+     }
+-    TRACE("controller 0 is the title's\n");
++    TRACE("controllers are the title's\n");
+     title_pad = handle;
+     return TRUE;
+ }
+@@ -144,31 +144,32 @@ static BOOL has_title_pad(void)
+ 
+ static BOOL title_pad_state(DWORD index, XINPUT_STATE *state)
+ {
+-    struct xinput_pad_state pad = {0};
++    struct xinput_pad_params params = {.index = index};
++    struct xinput_pad_state *pad = &params.state;
+ 
+-    if (index || __wine_unix_call(title_pad, unix_pad_state, &pad) || !pad.connected) return FALSE;
++    if (__wine_unix_call(title_pad, unix_pad_state, &params) || !pad->connected) return FALSE;
+     memset(state, 0, sizeof(*state));
+-    state->dwPacketNumber = pad.packet;
++    state->dwPacketNumber = pad->packet;
+     if (!title_pad_enabled) return TRUE;  /* XInputEnable(FALSE): neutral, still connected */
+-    state->Gamepad.wButtons = pad.buttons;
+-    state->Gamepad.bLeftTrigger = pad.left_trigger;
+-    state->Gamepad.bRightTrigger = pad.right_trigger;
+-    state->Gamepad.sThumbLX = pad.thumb_lx;
+-    state->Gamepad.sThumbLY = pad.thumb_ly;
+-    state->Gamepad.sThumbRX = pad.thumb_rx;
+-    state->Gamepad.sThumbRY = pad.thumb_ry;
++    state->Gamepad.wButtons = pad->buttons;
++    state->Gamepad.bLeftTrigger = pad->left_trigger;
++    state->Gamepad.bRightTrigger = pad->right_trigger;
++    state->Gamepad.sThumbLX = pad->thumb_lx;
++    state->Gamepad.sThumbLY = pad->thumb_ly;
++    state->Gamepad.sThumbRX = pad->thumb_rx;
++    state->Gamepad.sThumbRY = pad->thumb_ry;
+     return TRUE;
+ }
+ 
+ /* xinput_cs must be held */
+-static void title_pad_rumble(void)
++static void title_pad_rumble(DWORD index)
+ {
+-    struct xinput_rumble_params params = {0};
++    struct xinput_rumble_params params = {.index = index};
+ 
+     if (title_pad_enabled)
+     {
+-        params.left = title_pad_vibration.wLeftMotorSpeed;
+-        params.right = title_pad_vibration.wRightMotorSpeed;
++        params.left = title_pad_vibration[index].wLeftMotorSpeed;
++        params.right = title_pad_vibration[index].wRightMotorSpeed;
+     }
+     __wine_unix_call(title_pad, unix_pad_rumble, &params);
+ }
+@@ -894,7 +895,11 @@ void WINAPI DECLSPEC_HOTPATCH XInputEnable(BOOL enable)
+     {
+         EnterCriticalSection(&xinput_cs);
+         title_pad_enabled = enable;
+-        title_pad_rumble();
++        for (DWORD index = 0; index < XUSER_MAX_COUNT; index++)
++        {
++            XINPUT_STATE state;
++            if (title_pad_state(index, &state)) title_pad_rumble(index);
++        }
+         LeaveCriticalSection(&xinput_cs);
+         return;
+     }
+@@ -923,8 +928,8 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vib
+         if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+         if (!title_pad_state(index, &state)) return ERROR_DEVICE_NOT_CONNECTED;
+         EnterCriticalSection(&xinput_cs);
+-        title_pad_vibration = *vibration;
+-        title_pad_rumble();
++        title_pad_vibration[index] = *vibration;
++        title_pad_rumble(index);
+         LeaveCriticalSection(&xinput_cs);
+         return ERROR_SUCCESS;
+     }
+diff --git a/dlls/xinput1_3/unixlib.c b/dlls/xinput1_3/unixlib.c
+index 54488c8..c2e9c35 100644
+--- a/dlls/xinput1_3/unixlib.c
++++ b/dlls/xinput1_3/unixlib.c
+@@ -39,20 +39,32 @@
+  * are missing and xinput uses HID. */
+ static int (*title_pad)( struct xinput_pad_state *state );
+ static void (*title_rumble)( UINT32 left, UINT32 right );
++static int (*title_pad_indexed)( UINT32 index, struct xinput_pad_state *state );
++static int (*title_rumble_indexed)( UINT32 index, UINT32 left, UINT32 right );
+ 
+ static NTSTATUS pad_init( void *args )
+ {
+     title_pad = dlsym( RTLD_DEFAULT, "pw_wine_pad" );
+     title_rumble = dlsym( RTLD_DEFAULT, "pw_wine_set_rumble" );
+-    return title_pad ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
++    title_pad_indexed = dlsym( RTLD_DEFAULT, "pw_wine_pad_indexed" );
++    title_rumble_indexed = dlsym( RTLD_DEFAULT, "pw_wine_set_rumble_indexed" );
++    return title_pad_indexed || title_pad ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+ }
+ 
+ static NTSTATUS pad_state( void *args )
+ {
+-    struct xinput_pad_state *state = args;
+-
+-    if (!title_pad) return STATUS_NOT_SUPPORTED;
+-    if (!title_pad( state )) memset( state, 0, sizeof(*state) );
++    struct xinput_pad_params *params = args;
++    struct xinput_pad_state *state = &params->state;
++
++    if (title_pad_indexed)
++    {
++        if (!title_pad_indexed( params->index, state )) memset( state, 0, sizeof(*state) );
++    }
++    else
++    {
++        if (!title_pad) return STATUS_NOT_SUPPORTED;
++        if (params->index || !title_pad( state )) memset( state, 0, sizeof(*state) );
++    }
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -60,7 +72,10 @@ static NTSTATUS pad_rumble( void *args )
+ {
+     const struct xinput_rumble_params *params = args;
+ 
+-    if (!title_rumble) return STATUS_NOT_SUPPORTED;
++    if (title_rumble_indexed)
++        return title_rumble_indexed( params->index, params->left, params->right )
++               ? STATUS_INVALID_PARAMETER : STATUS_SUCCESS;
++    if (!title_rumble || params->index) return STATUS_NOT_SUPPORTED;
+     title_rumble( params->left, params->right );
+     return STATUS_SUCCESS;
+ }
+diff --git a/dlls/xinput1_3/unixlib.h b/dlls/xinput1_3/unixlib.h
+index b47d9cb..b6d32a2 100644
+--- a/dlls/xinput1_3/unixlib.h
++++ b/dlls/xinput1_3/unixlib.h
+@@ -40,10 +40,17 @@ struct xinput_pad_state
+ 
+ struct xinput_rumble_params
+ {
++    UINT32 index;
+     UINT32 left;
+     UINT32 right;
+ };
+ 
++struct xinput_pad_params
++{
++    UINT32 index;
++    struct xinput_pad_state state;
++};
++
+ enum xinput_unix_funcs
+ {
+     unix_pad_init,
+-- 
+2.43.0
+

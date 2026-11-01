@@ -17,18 +17,18 @@ static int pad_read(int32_t h,PwPadPs5Data *s,int32_t n)
 {assert((h==7||h==8)&&n==64);read_calls++;if(read_rc<0)return read_rc;
  memcpy(s,fixture,(size_t)fixture_count*sizeof(*s));return fixture_count;}
 static int pad_close(int32_t h){assert(h==7||h==8);close_calls++;return 0;}
-static int vibration_calls,vibration_rc;static uint8_t motors_seen[2];
+static int vibration_calls,vibration_rc,vibration_handle;static uint8_t motors_seen[2];
 static int pad_set_vibration(int32_t h,const uint8_t m[2])
-{assert(h==7);vibration_calls++;memcpy(motors_seen,m,2);return vibration_rc;}
+{assert(h==7||h==8);vibration_handle=h;vibration_calls++;memcpy(motors_seen,m,2);return vibration_rc;}
 static int32_t signed_in[PW_PAD_PS5_USERS]={42,-1,-1,-1};static int login_rc;
 static int login_users(int32_t ids[PW_PAD_PS5_USERS])
 {memcpy(ids,signed_in,sizeof(signed_in));return login_rc;}
 static int vibration_mode_calls,vibration_mode_seen;
 static int pad_set_vibration_mode(int32_t h,int32_t m)
-{assert(h==7);vibration_mode_calls++;vibration_mode_seen=m;return 0;}
+{assert(h==7||h==8);vibration_mode_calls++;vibration_mode_seen=m;return 0;}
 static int trigger_calls,trigger_rc;static PwPadPs5TriggerEffect trigger_seen;
 static int pad_set_trigger_effect(int32_t h,const PwPadPs5TriggerEffect *e)
-{assert(h==7);trigger_calls++;trigger_seen=*e;return trigger_rc;}
+{assert(h==7||h==8);trigger_calls++;trigger_seen=*e;return trigger_rc;}
 static const PwPadPs5Ops ops={user_initialize,foreground,terminate,pad_init,pad_open,pad_read,pad_close,
                               pad_set_vibration,login_users,pad_set_vibration_mode,
                               pad_set_trigger_effect};
@@ -195,11 +195,15 @@ int main(void)
     assert(pw_pad_ps5_open(&first,&ops,map,1)==PW_OK && first.owns_user_service);
     assert(pw_pad_ps5_open_other(&second,&first,-1,map,1)==PW_ERR_NOT_FOUND && !second.opened);
     signed_in[2]=43;
+    int modes=vibration_mode_calls;
     assert(pw_pad_ps5_open_other(&second,&first,-1,map,1)==PW_OK);
+    assert(vibration_mode_calls==modes+1 && vibration_mode_seen==PW_PAD_PS5_VIBRATION_COMPATIBLE);
     assert(second.opened && second.user_id==43 && second.pad_handle==8 && !second.owns_user_service);
     assert(open_calls==opened+2);
     fixture[0]=(PwPadPs5Data){.buttons=L1,.connected=1,.timestamp=4000,.connected_count=1};
     fixture_count=1;assert(pw_pad_ps5_read(&second)==PW_OK && second.core.pressed_edges==L1);
+    assert(pw_pad_ps5_vibrate(&second,20,40)==PW_OK && vibration_handle==8 &&
+           motors_seen[0]==20 && motors_seen[1]==40);
     assert(pw_pad_ps5_close(&second)==PW_OK && terminate_calls==terminated);
     /* Three users: the next pick after 43 is 44, then round to 43 again;
      * an id no longer signed in starts from the top. */

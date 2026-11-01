@@ -10,8 +10,8 @@
  * and next calls with dlsym. Frames go out through one sink, the title's
  * pw_present_frame path; input comes in through a bounded queue the title
  * fills from the DualSense and the driver drains in ProcessEvents. A
- * game's XInput controller is one more slot: the title keeps the newest
- * gamepad state in it, Wine's xinput reads it (its Unix library, patch
+ * game's controllers have independent slots: the title keeps the newest
+ * gamepad states in them, Wine's xinput reads them (its Unix library, patch
  * 0470, finds these calls with dlsym) and leaves the rumble it asks for;
  * the driver tells the game's windows when it comes or goes (patch 0984).
  * The title's in-game menu is another slot: the title stores what to draw
@@ -64,6 +64,16 @@ typedef struct PwWinePad {
     uint8_t left_trigger,right_trigger;
     int16_t thumb_lx,thumb_ly,thumb_rx,thumb_ry;
 } PwWinePad;
+
+enum { PW_WINE_PADS=2 };
+/* Indexed equivalents below: controller 0 is the foreground user's,
+ * controller 1 another signed-in user's. Setters return 0, or -1 for an
+ * invalid index; readers return 0 for an invalid index. Legacy calls
+ * below always address controller 0. */
+int pw_wine_set_pad_indexed(uint32_t index,const PwWinePad *pad);
+int pw_wine_pad_indexed(uint32_t index,PwWinePad *pad);
+int pw_wine_set_rumble_indexed(uint32_t index,uint32_t left,uint32_t right);
+int pw_wine_rumble_indexed(uint32_t index,uint32_t *left,uint32_t *right);
 
 /* Title side. */
 void pw_wine_set_present_sink(PwWinePresentSink sink,void *context);

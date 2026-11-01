@@ -135,7 +135,10 @@ int pw_pad_ps5_open_other(PwPadPs5 *pad,const PwPadPs5 *first,int32_t after,
     if(pad->user_id<0)return PW_ERR_NOT_FOUND;
     pad->pad_handle=pad->ops.pad_open(pad->user_id,0,0,NULL);
     if(pad->pad_handle<0)return PW_ERR_STATE;
-    pad->opened=1;centre_analog(pad);return PW_OK;
+    pad->opened=1;centre_analog(pad);
+    if(pad->ops.pad_set_vibration_mode)
+        pad->ops.pad_set_vibration_mode(pad->pad_handle,PW_PAD_PS5_VIBRATION_COMPATIBLE);
+    return PW_OK;
 }
 
 /* One native read converted to samples; count<0 reports a read error. */

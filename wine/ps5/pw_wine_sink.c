@@ -17,9 +17,9 @@ static uint32_t head,count;
 static PwWineSinkStats stats;
 static pthread_once_t wake_once=PTHREAD_ONCE_INIT;
 static int wake[2]={-1,-1};
-static PwWinePad pad_state;
+static PwWinePad pad_states[PW_WINE_PADS];
 static uint32_t pad_changes;
-static uint32_t rumble_left,rumble_right,rumble_changed;
+static uint32_t rumble_left[PW_WINE_PADS],rumble_right[PW_WINE_PADS],rumble_changed[PW_WINE_PADS];
 static struct pw_title_menu menu_state={.version=PW_TITLE_MENU_VERSION};
 /* Audio has its own lock: its sink blocks for a grain, which must not hold
  * up frames or input. */
@@ -178,20 +178,31 @@ static int same_pad(const PwWinePad *a,const PwWinePad *b)
            a->right_trigger==b->right_trigger && a->thumb_lx==b->thumb_lx &&
            a->thumb_ly==b->thumb_ly && a->thumb_rx==b->thumb_rx && a->thumb_ry==b->thumb_ry;
 }
-void pw_wine_set_pad(const PwWinePad *pad)
+int pw_wine_set_pad_indexed(uint32_t index,const PwWinePad *pad)
 {
     int changed;
+    if(index>=PW_WINE_PADS)return -1;
     pthread_mutex_lock(&lock);
-    changed=(pad!=NULL)!=(pad_state.connected!=0);
+    PwWinePad *state=&pad_states[index];
+    changed=(pad!=NULL)!=(state->connected!=0);
     if(changed)pad_changes++;
-    if(!pad)pad_state.connected=0;
-    else if(!pad_state.connected || !same_pad(pad,&pad_state)) {
-        uint32_t packet=pad_state.packet+1;
-        pad_state=*pad;pad_state.connected=1;
-        pad_state.packet=packet?packet:1;   /* 0 is never a packet */
+    if(!pad)state->connected=0;
+    else if(!state->connected || !same_pad(pad,state)) {
+        uint32_t packet=state->packet+1;
+        *state=*pad;state->connected=1;
+        state->packet=packet?packet:1;   /* 0 is never a packet */
+    }
+    if(changed && (rumble_left[index] || rumble_right[index])) {
+        rumble_left[index]=rumble_right[index]=0;
+        rumble_changed[index]=1;
     }
     pthread_mutex_unlock(&lock);
     if(changed)wake_driver();   /* the driver tells the game's windows */
+    return 0;
+}
+void pw_wine_set_pad(const PwWinePad *pad)
+{
+    (void)pw_wine_set_pad_indexed(0,pad);
 }
 uint32_t pw_wine_pad_changes(void)
 {
@@ -201,36 +212,52 @@ uint32_t pw_wine_pad_changes(void)
     pthread_mutex_unlock(&lock);
     return changes;
 }
-int pw_wine_pad(PwWinePad *pad)
+int pw_wine_pad_indexed(uint32_t index,PwWinePad *pad)
 {
     int connected;
     if(!pad)return 0;
+    if(index>=PW_WINE_PADS){memset(pad,0,sizeof(*pad));return 0;}
     pthread_mutex_lock(&lock);
-    connected=pad_state.connected!=0;
-    if(connected)*pad=pad_state;
+    connected=pad_states[index].connected!=0;
+    if(connected)*pad=pad_states[index];
     else memset(pad,0,sizeof(*pad));
     pthread_mutex_unlock(&lock);
     return connected;
 }
-void pw_wine_set_rumble(uint32_t left,uint32_t right)
+int pw_wine_pad(PwWinePad *pad)
 {
+    return pw_wine_pad_indexed(0,pad);
+}
+int pw_wine_set_rumble_indexed(uint32_t index,uint32_t left,uint32_t right)
+{
+    if(index>=PW_WINE_PADS)return -1;
     if(left>0xffffu)left=0xffffu;
     if(right>0xffffu)right=0xffffu;
     pthread_mutex_lock(&lock);
-    if(left!=rumble_left || right!=rumble_right) {
-        rumble_left=left;rumble_right=right;rumble_changed=1;
+    if(left!=rumble_left[index] || right!=rumble_right[index]) {
+        rumble_left[index]=left;rumble_right[index]=right;rumble_changed[index]=1;
     }
     pthread_mutex_unlock(&lock);
+    return 0;
+}
+void pw_wine_set_rumble(uint32_t left,uint32_t right)
+{
+    (void)pw_wine_set_rumble_indexed(0,left,right);
+}
+int pw_wine_rumble_indexed(uint32_t index,uint32_t *left,uint32_t *right)
+{
+    int changed;
+    if(index>=PW_WINE_PADS)return 0;
+    pthread_mutex_lock(&lock);
+    changed=(int)rumble_changed[index];rumble_changed[index]=0;
+    if(left)*left=rumble_left[index];
+    if(right)*right=rumble_right[index];
+    pthread_mutex_unlock(&lock);
+    return changed;
 }
 int pw_wine_rumble(uint32_t *left,uint32_t *right)
 {
-    int changed;
-    pthread_mutex_lock(&lock);
-    changed=(int)rumble_changed;rumble_changed=0;
-    if(left)*left=rumble_left;
-    if(right)*right=rumble_right;
-    pthread_mutex_unlock(&lock);
-    return changed;
+    return pw_wine_rumble_indexed(0,left,right);
 }
 
 void pw_wine_set_menu(const struct pw_title_menu *menu)
